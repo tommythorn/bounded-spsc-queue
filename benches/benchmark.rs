@@ -16,7 +16,8 @@ criterion_group!(
     bench_threaded_reverse_chan,
     bench_threaded_reverse_spsc,
     bench_single_spsc_batch,
-    bench_single_spsc_bulk_scalar
+    bench_single_spsc_bulk_scalar,
+    bench_single_spsc_skip
 );
 criterion_main!(benches);
 
@@ -50,6 +51,10 @@ fn bench_single_spsc_batch(c: &mut Criterion) {
 
 fn bench_single_spsc_bulk_scalar(c: &mut Criterion) {
     c.bench_function("bench_single_spsc_bulk_scalar", bench_spsc_bulk_scalar);
+}
+
+fn bench_single_spsc_skip(c: &mut Criterion) {
+    c.bench_function("bench_single_spsc_skip", bench_spsc_skip);
 }
 
 fn bench_chan(b: &mut Bencher) {
@@ -218,5 +223,16 @@ fn bench_spsc_bulk_scalar(b: &mut Bencher) {
         }
         black_box(output.len());
         assert_eq!(output.len(), 500);
+    });
+}
+
+fn bench_spsc_skip(b: &mut Bencher) {
+    let (p, c) = make(500);
+
+    b.iter(|| {
+        for i in 0..500 {
+            p.push(i);
+        }
+        assert_eq!(black_box(c.skip_n(500)), 500);
     });
 }

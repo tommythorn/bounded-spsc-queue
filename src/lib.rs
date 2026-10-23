@@ -123,7 +123,7 @@ impl<T> Buffer<T> {
         }
         let diff = self.shadow_tail.get().wrapping_sub(current_head).min(n);
         self.head
-            .store(current_head.wrapping_add(diff), Ordering::Release);
+            .store(current_head.wrapping_add(diff), Ordering::Relaxed);
         diff
     }
 
