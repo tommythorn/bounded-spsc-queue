@@ -122,8 +122,10 @@ impl<T> Buffer<T> {
             return 0;
         }
         let diff = self.shadow_tail.get().wrapping_sub(current_head).min(n);
-        self.head
-            .store(current_head.wrapping_add(diff), Ordering::Relaxed);
+        if diff != 0 {
+            self.head
+                .store(current_head.wrapping_add(diff), Ordering::Relaxed);
+        }
         diff
     }
 
@@ -177,6 +179,9 @@ impl<T> Buffer<T> {
         }
         let available = self.capacity - occupancy;
         let count = values.len().min(available);
+        if count == 0 {
+            return 0;
+        }
 
         if count == values.len() {
             // Fast path: move every value out of the Vec without dropping it.
