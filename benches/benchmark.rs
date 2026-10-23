@@ -13,7 +13,9 @@ criterion_group!(
     bench_threaded_chan,
     bench_threaded_spsc,
     bench_threaded_reverse_chan,
-    bench_threaded_reverse_spsc
+    bench_threaded_reverse_spsc,
+    bench_single_spsc_batch,
+    bench_single_spsc_bulk_scalar
 );
 criterion_main!(benches);
 
@@ -39,6 +41,14 @@ fn bench_threaded_reverse_chan(c: &mut Criterion) {
 
 fn bench_threaded_reverse_spsc(c: &mut Criterion) {
     c.bench_function("bench_reverse_spsc", bench_spsc_threaded2);
+}
+
+fn bench_single_spsc_batch(c: &mut Criterion) {
+    c.bench_function("bench_single_spsc_batch", bench_spsc_batch);
+}
+
+fn bench_single_spsc_bulk_scalar(c: &mut Criterion) {
+    c.bench_function("bench_single_spsc_bulk_scalar", bench_spsc_bulk_scalar);
 }
 
 fn bench_chan(b: &mut Bencher) {
@@ -170,4 +180,40 @@ fn bench_spsc_threaded2(b: &mut Bencher) {
     }
 
     handle.join().unwrap();
+}
+
+fn bench_spsc_batch(b: &mut Bencher) {
+    let (p, c) = make(500);
+    let mut input: Vec<u32> = Vec::with_capacity(500);
+    let mut output: Vec<u32> = Vec::with_capacity(500);
+
+    b.iter(|| {
+        input.clear();
+        input.extend(0..500);
+        assert_eq!(p.try_push_from(&mut input), 500);
+
+        output.clear();
+        assert_eq!(c.try_pop_n(&mut output, 500), 500);
+        assert_eq!(output.len(), 500);
+    });
+}
+
+fn bench_spsc_bulk_scalar(b: &mut Bencher) {
+    let (p, c) = make(500);
+    let mut input: Vec<u32> = Vec::with_capacity(500);
+    let mut output: Vec<u32> = Vec::with_capacity(500);
+
+    b.iter(|| {
+        input.clear();
+        input.extend(0..500);
+        for v in input.drain(..) {
+            p.push(v);
+        }
+
+        output.clear();
+        for _ in 0..500 {
+            output.push(c.pop());
+        }
+        assert_eq!(output.len(), 500);
+    });
 }

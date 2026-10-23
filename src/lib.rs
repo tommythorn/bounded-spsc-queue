@@ -127,6 +127,59 @@ impl<T> Buffer<T> {
         diff
     }
 
+    /// Pop up to `n` values off the buffer into `out`.
+    ///
+    /// Returns the number of values popped. Unlike `skip_n`, this transfers ownership of
+    /// the values into `out`, so destructors remain intact.
+    #[inline]
+    pub fn try_pop_n(&self, out: &mut Vec<T>, n: usize) -> usize {
+        let mut current_head = self.head.load(Ordering::Relaxed);
+        let current_tail = self.tail.load(Ordering::Acquire);
+        let available = current_tail.wrapping_sub(current_head);
+        let count = available.min(n);
+
+        self.shadow_tail.set(current_tail);
+        if count == 0 {
+            return 0;
+        }
+
+        out.reserve(count);
+        for _ in 0..count {
+            let v = unsafe { ptr::read(self.load(current_head)) };
+            out.push(v);
+            current_head = current_head.wrapping_add(1);
+        }
+        self.head.store(current_head, Ordering::Release);
+        count
+    }
+
+    /// Push values from `values` onto the buffer, up to available space.
+    ///
+    /// Returns the number of values pushed. Values that did not fit remain in `values`, so
+    /// the caller can retry after the consumer drains the queue.
+    #[inline]
+    pub fn try_push_from(&self, values: &mut Vec<T>) -> usize {
+        let mut current_tail = self.tail.load(Ordering::Relaxed);
+        let current_head = self.head.load(Ordering::Relaxed);
+        let occupancy = current_tail.wrapping_sub(current_head);
+        self.shadow_head.set(current_head);
+
+        if occupancy >= self.capacity {
+            return 0;
+        }
+        let available = self.capacity - occupancy;
+        let count = values.len().min(available);
+
+        for v in values.drain(..count) {
+            unsafe {
+                self.store(current_tail, v);
+            }
+            current_tail = current_tail.wrapping_add(1);
+        }
+        self.tail.store(current_tail, Ordering::Release);
+        count
+    }
+
     /// Pop a value off the buffer.
     ///
     /// This method will block until the buffer is non-empty.  The waiting strategy is a simple
@@ -417,6 +470,27 @@ impl<T> Producer<T> {
         (*self.buffer).try_push(v)
     }
 
+    /// Push all values from `values` onto the queue, up to available space.
+    ///
+    /// Returns the number of values pushed. Values that did not fit remain in `values`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bounded_spsc_queue::make;
+    ///
+    /// let (producer, _) = make(100);
+    ///
+    /// let mut values = vec![1, 2, 3];
+    /// let pushed = producer.try_push_from(&mut values);
+    /// assert_eq!(pushed, 3);
+    /// assert!(values.is_empty());
+    /// ```
+    #[inline]
+    pub fn try_push_from(&self, values: &mut Vec<T>) -> usize {
+        (*self.buffer).try_push_from(values)
+    }
+
     /// Returns the total capacity of this queue
     ///
     /// This value represents the total capacity of the queue when it is full.  It does not
@@ -531,6 +605,28 @@ impl<T> Consumer<T> {
         (*self.buffer).try_pop()
     }
 
+    /// Pop up to `n` values off the queue into `out`.
+    ///
+    /// Returns the number of values popped. This transfers ownership into `out`, unlike
+    /// `skip_n`, which leaks skipped values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bounded_spsc_queue::make;
+    ///
+    /// let (producer, consumer) = make(100);
+    /// producer.push(123);
+    ///
+    /// let mut values = Vec::new();
+    /// assert_eq!(consumer.try_pop_n(&mut values, 10), 1);
+    /// assert_eq!(values, [123]);
+    /// ```
+    #[inline]
+    pub fn try_pop_n(&self, out: &mut Vec<T>, n: usize) -> usize {
+        (*self.buffer).try_pop_n(out, n)
+    }
+
     /// Attempts to pop (and discard) at most `n` values off the buffer.
     ///
     /// Returns the amount of values successfully skipped.
@@ -633,6 +729,27 @@ mod tests {
         assert_eq!(c.skip_n(2), 2);
         assert_eq!(p.size(), 4);
         assert_eq!(p.free_space(), 6);
+    }
+
+    #[test]
+    fn test_batch_push_pop() {
+        let (p, c) = super::make(10);
+        let mut input: Vec<i32> = (0..20).collect();
+
+        assert_eq!(p.try_push_from(&mut input), 10);
+        assert_eq!(input, (10..20).collect::<Vec<_>>());
+
+        let mut out = Vec::new();
+        assert_eq!(c.try_pop_n(&mut out, 5), 5);
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
+        assert_eq!(c.try_pop_n(&mut out, 100), 5);
+        assert_eq!(out, (0..10).collect::<Vec<_>>());
+
+        assert_eq!(p.try_push_from(&mut input), 10);
+        assert!(input.is_empty());
+        out.clear();
+        assert_eq!(c.try_pop_n(&mut out, 10), 10);
+        assert_eq!(out, (10..20).collect::<Vec<_>>());
     }
 
     #[test]
