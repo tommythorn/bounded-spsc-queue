@@ -5,6 +5,9 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[cfg(target_arch = "aarch64")]
+const CACHELINE_LEN: usize = 128;
+#[cfg(not(target_arch = "aarch64"))]
 const CACHELINE_LEN: usize = 64;
 
 macro_rules! cacheline_pad {
@@ -18,7 +21,8 @@ macro_rules! cacheline_pad {
 /// Buffer holds a pointer to allocated memory which represents the bounded
 /// ring buffer, as well as a head and tail atomicUsize which the producer and consumer
 /// use to track location in the ring.
-#[repr(C, align(64))]
+#[cfg_attr(target_arch = "aarch64", repr(C, align(128)))]
+#[cfg_attr(not(target_arch = "aarch64"), repr(C, align(64)))]
 pub struct Buffer<T> {
     /// A pointer to the allocated ring buffer
     buffer: *mut T,
