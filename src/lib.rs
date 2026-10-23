@@ -143,11 +143,18 @@ impl<T> Buffer<T> {
             return 0;
         }
 
+        let base_len = out.len();
         out.reserve(count);
-        for _ in 0..count {
+        let spare = out.spare_capacity_mut();
+        for slot in spare.iter_mut().take(count) {
             let v = unsafe { ptr::read(self.load(current_head)) };
-            out.push(v);
+            unsafe {
+                ptr::write(slot.as_mut_ptr(), v);
+            }
             current_head = current_head.wrapping_add(1);
+        }
+        unsafe {
+            out.set_len(base_len + count);
         }
         self.head.store(current_head, Ordering::Release);
         count
@@ -170,11 +177,25 @@ impl<T> Buffer<T> {
         let available = self.capacity - occupancy;
         let count = values.len().min(available);
 
-        for v in values.drain(..count) {
-            unsafe {
-                self.store(current_tail, v);
+        if count == values.len() {
+            // Fast path: move every value out of the Vec without dropping it.
+            let base = values.as_mut_ptr();
+            for i in 0..count {
+                unsafe {
+                    self.store(current_tail, ptr::read(base.add(i)));
+                }
+                current_tail = current_tail.wrapping_add(1);
             }
-            current_tail = current_tail.wrapping_add(1);
+            unsafe {
+                values.set_len(0);
+            }
+        } else {
+            for v in values.drain(..count) {
+                unsafe {
+                    self.store(current_tail, v);
+                }
+                current_tail = current_tail.wrapping_add(1);
+            }
         }
         self.tail.store(current_tail, Ordering::Release);
         count
