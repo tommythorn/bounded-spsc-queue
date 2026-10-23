@@ -20,6 +20,11 @@ name = "bounded_spsc_queue"
 name = "benchmark"
 harness = false
 
+[features]
+cacheline64 = []
+cacheline128 = []
+cacheline256 = []
+
 [dev-dependencies]
 criterion = "0.8.2"
 time = "0.1.39"
