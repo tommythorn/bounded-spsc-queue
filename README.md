@@ -130,5 +130,5 @@ Takeaways:
 - Apple M5 uses 128-byte hardware cache lines and defaults to 128-byte padding.
   64-byte padding slightly helps reverse, but 128-byte is faster on the forward
   threaded path and bulk paths are effectively equal.
-- Bulk APIs are roughly 10x faster than scalar loops on these machines; the
-  exact ratio varies per platform.
+- Bulk APIs are roughly 16–47× faster than scalar loops on these machines;
+  the exact ratio varies per platform (Zen 3/5/Intel around 16–18×, Apple M5 ~47×).
