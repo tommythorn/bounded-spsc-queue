@@ -192,12 +192,20 @@ impl<T> Buffer<T> {
             }
             current_tail = current_tail.wrapping_add(count);
         } else {
-            for v in values.drain(..count) {
-                unsafe {
-                    self.store(current_tail, v);
+            // Move the prefix into the queue and compact the remaining values,
+            // avoiding the per-element Drain machinery for partial batches.
+            let base = values.as_mut_ptr();
+            let start = current_tail & (self.allocated_size - 1);
+            let first = count.min(self.allocated_size - start);
+            unsafe {
+                ptr::copy_nonoverlapping(base, self.buffer.add(start), first);
+                if count > first {
+                    ptr::copy_nonoverlapping(base.add(first), self.buffer.add(0), count - first);
                 }
-                current_tail = current_tail.wrapping_add(1);
+                ptr::copy(base.add(count), base, values.len() - count);
+                values.set_len(values.len() - count);
             }
+            current_tail = current_tail.wrapping_add(count);
         }
         self.tail.store(current_tail, Ordering::Release);
         count
@@ -785,6 +793,19 @@ mod tests {
 
         let mut out = Vec::new();
         assert_eq!(c.try_pop_n(&mut out, 4), 2);
+        assert_eq!(out, ["foo", "bar"]);
+    }
+
+    #[test]
+    fn test_batch_partial_non_copy() {
+        let (p, c) = super::make(2);
+        let mut input: Vec<String> = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
+
+        assert_eq!(p.try_push_from(&mut input), 2);
+        assert_eq!(input, ["baz"]);
+
+        let mut out = Vec::new();
+        assert_eq!(c.try_pop_n(&mut out, 2), 2);
         assert_eq!(out, ["foo", "bar"]);
     }
 
