@@ -2,6 +2,7 @@ use std::thread;
 
 use bounded_spsc_queue::make;
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
+use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -55,7 +56,7 @@ fn bench_chan(b: &mut Bencher) {
     let (tx, rx) = sync_channel::<u8>(500);
     b.iter(|| {
         tx.send(1).unwrap();
-        rx.recv().unwrap()
+        black_box(rx.recv().unwrap())
     });
 }
 
@@ -74,7 +75,7 @@ fn bench_chan_threaded(b: &mut Bencher) {
         }
     });
 
-    b.iter(|| tx.send(1u64));
+    b.iter(|| black_box(tx.send(1u64)));
 
     let flag_clone = arc_flag;
     flag_clone.store(true, Ordering::Release);
@@ -102,7 +103,7 @@ fn bench_chan_threaded2(b: &mut Bencher) {
         }
     });
 
-    b.iter(|| rx.recv().unwrap());
+    b.iter(|| black_box(rx.recv().unwrap()));
 
     let flag_clone = arc_flag;
     flag_clone.store(true, Ordering::Release);
@@ -120,7 +121,7 @@ fn bench_spsc(b: &mut Bencher) {
 
     b.iter(|| {
         p.push(1);
-        c.pop()
+        black_box(c.pop())
     });
 }
 
@@ -169,7 +170,7 @@ fn bench_spsc_threaded2(b: &mut Bencher) {
         }
     });
 
-    b.iter(|| c.pop());
+    b.iter(|| black_box(c.pop()));
 
     let flag_clone = arc_flag;
     flag_clone.store(true, Ordering::Release);
@@ -190,10 +191,11 @@ fn bench_spsc_batch(b: &mut Bencher) {
     b.iter(|| {
         input.clear();
         input.extend(0..500);
-        assert_eq!(p.try_push_from(&mut input), 500);
+        black_box(p.try_push_from(&mut input));
 
         output.clear();
-        assert_eq!(c.try_pop_n(&mut output, 500), 500);
+        assert_eq!(black_box(c.try_pop_n(&mut output, 500)), 500);
+        black_box(output.len());
         assert_eq!(output.len(), 500);
     });
 }
@@ -214,6 +216,7 @@ fn bench_spsc_bulk_scalar(b: &mut Bencher) {
         for _ in 0..500 {
             output.push(c.pop());
         }
+        black_box(output.len());
         assert_eq!(output.len(), 500);
     });
 }
