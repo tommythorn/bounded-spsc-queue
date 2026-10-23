@@ -530,7 +530,7 @@ impl<T> Producer<T> {
     pub fn size(&self) -> usize {
         self.buffer
             .tail
-            .load(Ordering::Acquire)
+            .load(Ordering::Relaxed)
             .wrapping_sub(self.buffer.head.load(Ordering::Acquire))
     }
 
@@ -696,7 +696,7 @@ impl<T> Consumer<T> {
         self.buffer
             .tail
             .load(Ordering::Acquire)
-            .wrapping_sub(self.buffer.head.load(Ordering::Acquire))
+            .wrapping_sub(self.buffer.head.load(Ordering::Relaxed))
     }
 }
 
