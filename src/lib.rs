@@ -87,6 +87,7 @@ impl<T> Buffer<T> {
     ///     None => {}                     // Buffer empty, try again later
     /// }
     /// ```
+    #[inline(always)]
     pub fn try_pop(&self) -> Option<T> {
         let current_head = self.head.load(Ordering::Relaxed);
 
@@ -112,6 +113,7 @@ impl<T> Buffer<T> {
     /// *WARNING:* This will leak at most `n` values from the buffer, i.e. the destructors of the
     /// objects skipped over will not be called. This function is intended to be used on buffers that
     /// contain non-`Drop` data, such as a `Buffer<f32>`.
+    #[inline(always)]
     pub fn skip_n(&self, n: usize) -> usize {
         let current_head = self.head.load(Ordering::Relaxed);
 
@@ -144,6 +146,7 @@ impl<T> Buffer<T> {
     /// let t = c.pop();
     /// assert_eq!(t, 123);
     /// ```
+    #[inline(always)]
     pub fn pop(&self) -> T {
         loop {
             match self.try_pop() {
@@ -172,12 +175,13 @@ impl<T> Buffer<T> {
     ///     None => {}     // Value was successfully pushed onto the buffer
     /// }
     /// ```
+    #[inline(always)]
     pub fn try_push(&self, v: T) -> Option<T> {
         let current_tail = self.tail.load(Ordering::Relaxed);
 
         // Use wrapping arithmetic so the check stays correct after the indices wrap.
         if current_tail.wrapping_sub(self.shadow_head.get()) >= self.capacity {
-            self.shadow_head.set(self.head.load(Ordering::Acquire));
+            self.shadow_head.set(self.head.load(Ordering::Relaxed));
             if current_tail.wrapping_sub(self.shadow_head.get()) >= self.capacity {
                 return Some(v);
             }
@@ -208,6 +212,7 @@ impl<T> Buffer<T> {
     /// // Block until we can push this value onto the buffer
     /// p.push(123);
     /// ```
+    #[inline(always)]
     pub fn push(&self, v: T) {
         let mut t = v;
         loop {
@@ -383,6 +388,7 @@ impl<T> Producer<T> {
     /// // Block until we can push this value onto the queue
     /// producer.push(123);
     /// ```
+    #[inline(always)]
     pub fn push(&self, v: T) {
         (*self.buffer).push(v);
     }
@@ -406,6 +412,7 @@ impl<T> Producer<T> {
     ///     None => {}                     // Value added to queue
     /// }
     /// ```
+    #[inline(always)]
     pub fn try_push(&self, v: T) -> Option<T> {
         (*self.buffer).try_push(v)
     }
@@ -494,6 +501,7 @@ impl<T> Consumer<T> {
     /// let t = consumer.pop();
     /// assert_eq!(t, 123);
     /// ```
+    #[inline(always)]
     pub fn pop(&self) -> T {
         (*self.buffer).pop()
     }
@@ -518,6 +526,7 @@ impl<T> Consumer<T> {
     ///     None => {}                     // Queue empty, try again later
     /// }
     /// ```
+    #[inline(always)]
     pub fn try_pop(&self) -> Option<T> {
         (*self.buffer).try_pop()
     }
@@ -546,6 +555,7 @@ impl<T> Consumer<T> {
     /// read_position += consumer.skip_n(512); // try to skip at most 512 elements
     /// assert_eq!(read_position, 20);
     /// ```
+    #[inline(always)]
     pub fn skip_n(&self, n: usize) -> usize {
         (*self.buffer).skip_n(n)
     }
