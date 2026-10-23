@@ -133,7 +133,7 @@ impl<T> Buffer<T> {
     /// the values into `out`, so destructors remain intact.
     #[inline]
     pub fn try_pop_n(&self, out: &mut Vec<T>, n: usize) -> usize {
-        let mut current_head = self.head.load(Ordering::Relaxed);
+        let current_head = self.head.load(Ordering::Relaxed);
         let current_tail = self.tail.load(Ordering::Acquire);
         let available = current_tail.wrapping_sub(current_head);
         let count = available.min(n);
@@ -146,17 +146,18 @@ impl<T> Buffer<T> {
         let base_len = out.len();
         out.reserve(count);
         let spare = out.spare_capacity_mut();
-        for slot in spare.iter_mut().take(count) {
-            let v = unsafe { ptr::read(self.load(current_head)) };
-            unsafe {
-                ptr::write(slot.as_mut_ptr(), v);
-            }
-            current_head = current_head.wrapping_add(1);
-        }
+        let dest = spare.as_mut_ptr() as *mut T;
+        let start = current_head & (self.allocated_size - 1);
+        let first = count.min(self.allocated_size - start);
         unsafe {
+            ptr::copy_nonoverlapping(self.buffer.add(start), dest, first);
+            if count > first {
+                ptr::copy_nonoverlapping(self.buffer.add(0), dest.add(first), count - first);
+            }
             out.set_len(base_len + count);
         }
-        self.head.store(current_head, Ordering::Release);
+        self.head
+            .store(current_head.wrapping_add(count), Ordering::Release);
         count
     }
 
@@ -180,15 +181,16 @@ impl<T> Buffer<T> {
         if count == values.len() {
             // Fast path: move every value out of the Vec without dropping it.
             let base = values.as_mut_ptr();
-            for i in 0..count {
-                unsafe {
-                    self.store(current_tail, ptr::read(base.add(i)));
-                }
-                current_tail = current_tail.wrapping_add(1);
-            }
+            let start = current_tail & (self.allocated_size - 1);
+            let first = count.min(self.allocated_size - start);
             unsafe {
+                ptr::copy_nonoverlapping(base, self.buffer.add(start), first);
+                if count > first {
+                    ptr::copy_nonoverlapping(base.add(first), self.buffer.add(0), count - first);
+                }
                 values.set_len(0);
             }
+            current_tail = current_tail.wrapping_add(count);
         } else {
             for v in values.drain(..count) {
                 unsafe {
@@ -771,6 +773,19 @@ mod tests {
         out.clear();
         assert_eq!(c.try_pop_n(&mut out, 10), 10);
         assert_eq!(out, (10..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_batch_non_copy() {
+        let (p, c) = super::make(4);
+        let mut input: Vec<String> = vec!["foo".to_string(), "bar".to_string()];
+
+        assert_eq!(p.try_push_from(&mut input), 2);
+        assert!(input.is_empty());
+
+        let mut out = Vec::new();
+        assert_eq!(c.try_pop_n(&mut out, 4), 2);
+        assert_eq!(out, ["foo", "bar"]);
     }
 
     #[test]
