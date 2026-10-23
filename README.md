@@ -21,10 +21,10 @@ indirection, and generally simpler operations to achieve a bounded SPSC queue.
 
 ```rust
 use std::thread;
-use bounded_spsc_queue::{Producer, Consumer};
+use bounded_spsc_queue::make;
 
 // Initialize a queue with capacity of 500 values
-let (p, c) = bounded_spsc_queue::make(500);
+let (p, c) = make(500);
 
 // Spawn a new thread and move the Producer into it
 thread::spawn(move|| {

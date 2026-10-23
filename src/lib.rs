@@ -1,14 +1,9 @@
-#![feature(allocator_api)]
-
-extern crate core;
-
 use core::alloc::Layout;
 use core::{mem, ptr};
 use std::alloc;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::usize;
 
 const CACHELINE_LEN: usize = 64;
 
@@ -23,7 +18,7 @@ macro_rules! cacheline_pad {
 /// Buffer holds a pointer to allocated memory which represents the bounded
 /// ring buffer, as well as a head and tail atomicUsize which the producer and consumer
 /// use to track location in the ring.
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct Buffer<T> {
     /// A pointer to the allocated ring buffer
     buffer: *mut T,
@@ -77,11 +72,15 @@ impl<T> Buffer<T> {
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
+    /// let (p, c) = make(500);
+    /// p.push(123);
+    ///
     /// // Attempt to pop off a value
-    /// let t = buffer.try_pop();
-    /// match t {
-    ///   Some(v) => {}, // Got a value
-    ///   None => {}     // Buffer empty, try again later
+    /// match c.try_pop() {
+    ///     Some(v) => assert_eq!(v, 123), // Got a value
+    ///     None => {}                     // Buffer empty, try again later
     /// }
     /// ```
     pub fn try_pop(&self) -> Option<T> {
@@ -116,10 +115,7 @@ impl<T> Buffer<T> {
         if current_head == self.shadow_tail.get() {
             return 0;
         }
-        let mut diff = self.shadow_tail.get().wrapping_sub(current_head);
-        if diff > n {
-            diff = n
-        }
+        let diff = self.shadow_tail.get().wrapping_sub(current_head).min(n);
         self.head
             .store(current_head.wrapping_add(diff), Ordering::Release);
         diff
@@ -135,8 +131,14 @@ impl<T> Buffer<T> {
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
+    /// let (p, c) = make(500);
+    /// p.push(123);
+    ///
     /// // Block until a value is ready
-    /// let t = buffer.pop();
+    /// let t = c.pop();
+    /// assert_eq!(t, 123);
     /// ```
     pub fn pop(&self) -> T {
         loop {
@@ -156,19 +158,23 @@ impl<T> Buffer<T> {
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
+    /// let (p, _) = make(500);
+    ///
     /// // Attempt to push a value onto the buffer
-    /// let t = buffer.try_push(123);
-    /// match t {
-    ///   Some(v) => {}, // Buffer was full, try again later
-    ///   None => {}     // Value was successfully pushed onto the buffer
+    /// match p.try_push(123) {
+    ///     Some(_v) => {} // Buffer was full, try again later
+    ///     None => {}     // Value was successfully pushed onto the buffer
     /// }
     /// ```
     pub fn try_push(&self, v: T) -> Option<T> {
         let current_tail = self.tail.load(Ordering::Relaxed);
 
-        if self.shadow_head.get() + self.capacity <= current_tail {
-            self.shadow_head.set(self.head.load(Ordering::Relaxed));
-            if self.shadow_head.get() + self.capacity <= current_tail {
+        // Use wrapping arithmetic so the check stays correct after the indices wrap.
+        if current_tail.wrapping_sub(self.shadow_head.get()) >= self.capacity {
+            self.shadow_head.set(self.head.load(Ordering::Acquire));
+            if current_tail.wrapping_sub(self.shadow_head.get()) >= self.capacity {
                 return Some(v);
             }
         }
@@ -191,8 +197,12 @@ impl<T> Buffer<T> {
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
+    /// let (p, _) = make(500);
+    ///
     /// // Block until we can push this value onto the buffer
-    /// buffer.try_push(123);
+    /// p.push(123);
     /// ```
     pub fn push(&self, v: T) {
         let mut t = v;
@@ -265,6 +275,8 @@ impl<T> Drop for Buffer<T> {
 /// Here is a simple usage of make, using the queue within the same thread:
 ///
 /// ```
+/// use bounded_spsc_queue::make;
+///
 /// // Create a queue with capacity to hold 100 values
 /// let (p, c) = make(100);
 ///
@@ -282,6 +294,7 @@ impl<T> Drop for Buffer<T> {
 ///
 /// ```
 /// use std::thread;
+/// use bounded_spsc_queue::make;
 ///
 /// let (p, c) = make(500);
 ///
@@ -302,16 +315,18 @@ impl<T> Drop for Buffer<T> {
 ///
 /// # Panics
 ///
-/// If the requested queue size is larger than available memory (e.g.
-/// `capacity.next_power_of_two() * size_of::<T>() > available memory` ), this function will abort
-/// with an OOM panic.
+/// If the requested capacity overflows `usize`, or the calculated allocation size is larger
+/// than available memory, this function will panic or abort with an OOM error.
 pub fn make<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
-    let ptr = unsafe { allocate_buffer(capacity) };
+    let allocated_size = capacity
+        .checked_next_power_of_two()
+        .expect("capacity overflow");
+    let ptr = unsafe { allocate_buffer::<T>(allocated_size) };
 
     let arc = Arc::new(Buffer {
         buffer: ptr,
         capacity,
-        allocated_size: capacity.next_power_of_two(),
+        allocated_size,
         _padding1: [0; cacheline_pad!(3)],
 
         head: AtomicUsize::new(0),
@@ -332,9 +347,8 @@ pub fn make<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
 }
 
 /// Allocates a memory buffer on the heap and returns a pointer to it
-unsafe fn allocate_buffer<T>(capacity: usize) -> *mut T {
-    let adjusted_size = capacity.next_power_of_two();
-    let size = adjusted_size
+unsafe fn allocate_buffer<T>(allocated_size: usize) -> *mut T {
+    let size = allocated_size
         .checked_mul(mem::size_of::<T>())
         .expect("capacity overflow");
 
@@ -358,6 +372,8 @@ impl<T> Producer<T> {
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
     /// let (producer, _) = make(100);
     ///
     /// // Block until we can push this value onto the queue
@@ -371,17 +387,19 @@ impl<T> Producer<T> {
     ///
     /// This method does not block.  If the queue is not full, the value will be added to the
     /// queue and the method will return `None`, signifying success.  If the queue is full,
-    /// this method will return `Some(v)``, where `v` is your original value.
+    /// this method will return `Some(v)`, where `v` is your original value.
     ///
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
     /// let (producer, _) = make(100);
     ///
     /// // Attempt to add this value to the queue
-    /// match producer.try push(123) {
-    ///     Some(v) => {}, // Queue full, try again later
-    ///     None => {}     // Value added to queue
+    /// match producer.try_push(123) {
+    ///     Some(v) => assert_eq!(v, 123), // Queue full, try again later
+    ///     None => {}                     // Value added to queue
     /// }
     /// ```
     pub fn try_push(&self, v: T) -> Option<T> {
@@ -396,6 +414,8 @@ impl<T> Producer<T> {
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
     /// let (producer, _) = make(100);
     ///
     /// assert!(producer.capacity() == 100);
@@ -414,6 +434,8 @@ impl<T> Producer<T> {
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
     /// let (producer, _) = make(100);
     ///
     /// assert!(producer.size() == 0);
@@ -421,7 +443,10 @@ impl<T> Producer<T> {
     /// assert!(producer.size() == 1);
     /// ```
     pub fn size(&self) -> usize {
-        self.buffer.tail.load(Ordering::Acquire) - self.buffer.head.load(Ordering::Acquire)
+        self.buffer
+            .tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.buffer.head.load(Ordering::Acquire))
     }
 
     /// Returns the available space in the queue
@@ -432,6 +457,8 @@ impl<T> Producer<T> {
     /// # Examples
     ///
     /// ```
+    /// use bounded_spsc_queue::make;
+    ///
     /// let (producer, _) = make(100);
     ///
     /// assert!(producer.free_space() == 100);
@@ -449,15 +476,19 @@ impl<T> Consumer<T> {
     /// If the buffer contains values, this method will execute immediately and return a value.
     /// If the buffer is empty, this method will block until a value becomes available.  The
     /// waiting strategy is a simple spin-wait. If you do not want a spin-wait burning CPU, you
-    /// should call `try_push()` directly and implement a different waiting strategy.
+    /// should call `try_pop()` directly and implement a different waiting strategy.
     ///
     /// # Examples
     ///
     /// ```
-    /// let (_, consumer) = make(100);
+    /// use bounded_spsc_queue::make;
+    ///
+    /// let (producer, consumer) = make(100);
+    /// producer.push(123);
     ///
     /// // Block until a value becomes available
     /// let t = consumer.pop();
+    /// assert_eq!(t, 123);
     /// ```
     pub fn pop(&self) -> T {
         (*self.buffer).pop()
@@ -472,15 +503,15 @@ impl<T> Consumer<T> {
     /// # Examples
     ///
     /// ```
-    /// use bounded_spsc_queue::*;
+    /// use bounded_spsc_queue::make;
     ///
-    /// let (_, consumer) = make(100);
+    /// let (producer, consumer) = make(100);
+    /// producer.push(123);
     ///
     /// // Attempt to pop a value off the queue
-    /// let t = consumer.try_pop();
-    /// match t {
-    ///     Some(v) => {},      // Successfully popped a value
-    ///     None => {}          // Queue empty, try again later
+    /// match consumer.try_pop() {
+    ///     Some(v) => assert_eq!(v, 123), // Successfully popped a value
+    ///     None => {}                     // Queue empty, try again later
     /// }
     /// ```
     pub fn try_pop(&self) -> Option<T> {
@@ -500,12 +531,16 @@ impl<T> Consumer<T> {
     /// # Examples
     ///
     /// ```
-    /// use bounded_spsc_queue::*;
+    /// use bounded_spsc_queue::make;
     ///
-    /// let (_, consumer) = make(100);
+    /// let (producer, consumer) = make(100);
+    /// for i in 0..20 {
+    ///     producer.push(i);
+    /// }
     ///
     /// let mut read_position = 0; // current buffer index
     /// read_position += consumer.skip_n(512); // try to skip at most 512 elements
+    /// assert_eq!(read_position, 20);
     /// ```
     pub fn skip_n(&self, n: usize) -> usize {
         (*self.buffer).skip_n(n)
@@ -518,11 +553,13 @@ impl<T> Consumer<T> {
     /// # Examples
     ///
     /// ```
-    /// let (_, consumer) = make(100);
+    /// use bounded_spsc_queue::make;
+    ///
+    /// let (producer, consumer) = make(100);
     ///
     /// assert!(consumer.capacity() == 100);
-    /// let t = consumer.pop();
-    /// assert!(producer.capacity() == 100);
+    /// producer.push(123);
+    /// assert!(consumer.size() == 1);
     /// ```
     pub fn capacity(&self) -> usize {
         self.buffer.capacity
@@ -536,16 +573,20 @@ impl<T> Consumer<T> {
     /// # Examples
     ///
     /// ```
-    /// let (_, consumer) = make(100);
+    /// use bounded_spsc_queue::make;
     ///
-    /// //... producer pushes somewhere ...
+    /// let (producer, consumer) = make(100);
     ///
-    /// assert!(consumer.size() == 10);
+    /// producer.push(123);
+    /// assert!(consumer.size() == 1);
     /// consumer.pop();
-    /// assert!(producer.size() == 9);
+    /// assert!(consumer.size() == 0);
     /// ```
     pub fn size(&self) -> usize {
-        self.buffer.tail.load(Ordering::Acquire) - self.buffer.head.load(Ordering::Acquire)
+        self.buffer
+            .tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.buffer.head.load(Ordering::Acquire))
     }
 }
 
@@ -557,7 +598,27 @@ mod tests {
 
     #[test]
     fn test_buffer_size() {
-        assert_eq!(::std::mem::size_of::<Buffer<()>>(), 3 * CACHELINE_LEN);
+        assert_eq!(std::mem::size_of::<Buffer<()>>(), 3 * CACHELINE_LEN);
+        assert_eq!(std::mem::align_of::<Buffer<()>>(), CACHELINE_LEN);
+    }
+
+    #[test]
+    fn test_wrapped_index_arithmetic() {
+        // Simulate indices that have wrapped past usize::MAX.
+        let (p, c) = super::make::<()>(10);
+        p.buffer.tail.store(usize::MAX, Ordering::Relaxed);
+        p.buffer.head.store(usize::MAX - 5, Ordering::Relaxed);
+
+        assert_eq!(p.size(), 5);
+        assert_eq!(p.free_space(), 5);
+
+        assert!(p.try_push(()).is_none());
+        assert_eq!(p.size(), 6);
+        assert_eq!(p.free_space(), 4);
+
+        assert_eq!(c.skip_n(2), 2);
+        assert_eq!(p.size(), 4);
+        assert_eq!(p.free_space(), 6);
     }
 
     #[test]
@@ -681,9 +742,8 @@ mod tests {
         }
     }
 
-    extern crate time;
-    use self::time::PreciseTime;
     use std::sync::mpsc::sync_channel;
+    use time::PreciseTime;
 
     #[test]
     #[ignore]

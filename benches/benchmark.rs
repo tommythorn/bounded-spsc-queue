@@ -1,11 +1,7 @@
-extern crate bounded_spsc_queue;
-#[macro_use]
-extern crate criterion;
-extern crate time;
-
 use std::thread;
 
-use criterion::{Bencher, Criterion};
+use bounded_spsc_queue::make;
+use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -54,12 +50,12 @@ fn bench_chan(b: &mut Bencher) {
 }
 
 fn bench_chan_threaded(b: &mut Bencher) {
-    let (tx, rx) = sync_channel::<u8>(500);
+    let (tx, rx) = sync_channel::<u64>(500);
     let flag = AtomicBool::new(false);
     let arc_flag = Arc::new(flag);
 
     let flag_clone = arc_flag.clone();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
@@ -68,7 +64,7 @@ fn bench_chan_threaded(b: &mut Bencher) {
         }
     });
 
-    b.iter(|| tx.send(1));
+    b.iter(|| tx.send(1u64));
 
     let flag_clone = arc_flag;
     flag_clone.store(true, Ordering::Release);
@@ -77,6 +73,8 @@ fn bench_chan_threaded(b: &mut Bencher) {
     for _ in 0..400 {
         let _ = tx.send(1);
     }
+
+    handle.join().unwrap();
 }
 
 fn bench_chan_threaded2(b: &mut Bencher) {
@@ -85,7 +83,7 @@ fn bench_chan_threaded2(b: &mut Bencher) {
     let arc_flag = Arc::new(flag);
 
     let flag_clone = arc_flag.clone();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
@@ -103,10 +101,12 @@ fn bench_chan_threaded2(b: &mut Bencher) {
     for _ in 0..400 {
         let _ = rx.try_recv();
     }
+
+    handle.join().unwrap();
 }
 
 fn bench_spsc(b: &mut Bencher) {
-    let (p, c) = bounded_spsc_queue::make(500);
+    let (p, c) = make(500);
 
     b.iter(|| {
         p.push(1);
@@ -115,13 +115,13 @@ fn bench_spsc(b: &mut Bencher) {
 }
 
 fn bench_spsc_threaded(b: &mut Bencher) {
-    let (p, c) = bounded_spsc_queue::make(500);
+    let (p, c) = make(500);
 
     let flag = AtomicBool::new(false);
     let arc_flag = Arc::new(flag);
 
     let flag_clone = arc_flag.clone();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
@@ -139,16 +139,18 @@ fn bench_spsc_threaded(b: &mut Bencher) {
     for _ in 0..400 {
         p.try_push(1);
     }
+
+    handle.join().unwrap();
 }
 
 fn bench_spsc_threaded2(b: &mut Bencher) {
-    let (p, c) = bounded_spsc_queue::make(500);
+    let (p, c) = make(500);
 
     let flag = AtomicBool::new(false);
     let arc_flag = Arc::new(flag);
 
     let flag_clone = arc_flag.clone();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         while !flag_clone.load(Ordering::Acquire) {
             // Try to do as much work as possible without checking the atomic
             for _ in 0..400 {
@@ -166,4 +168,6 @@ fn bench_spsc_threaded2(b: &mut Bencher) {
     for _ in 0..400 {
         c.try_pop();
     }
+
+    handle.join().unwrap();
 }
