@@ -132,3 +132,49 @@ Takeaways:
   threaded path and bulk paths are effectively equal.
 - Bulk APIs are roughly 16–47× faster than scalar loops on these machines;
   the exact ratio varies per platform (Zen 3/5/Intel around 16–18×, Apple M5 ~47×).
+
+## Experimental Cache-line Slot Queue
+
+`make_cacheline<T>(capacity)` creates an additional queue type intended for
+small IPC messages. Each slot occupies one cache line and carries payload bytes
+plus an atomic descriptor containing a phase bit and advisory free-space
+metadata. The producer publishes submission slots; the consumer publishes
+completion credits; the producer consumes credits to reclaim submission slots.
+
+```rust
+use bounded_spsc_queue::make_cacheline;
+
+let (p, c) = make_cacheline::<u64>(64);
+p.push(42);
+assert_eq!(c.pop(), 42);
+```
+
+Requirements:
+
+- `capacity > 0`
+- payload fits after the descriptor word (`cacheline - 8` bytes on 64-bit)
+- payload alignment does not exceed the cache-line size
+
+This queue is experimental and separate from the counter-based default queue.
+It is deliberately not the default: it trades extra cache-line traffic for a
+phase-bit/credit protocol, and current measurements show it is slower than the
+counter queue on all tested machines.
+
+Cache-line queue measurements (ns per operation; Criterion 0.8.2):
+
+| Platform | Single | Threaded forward | Threaded reverse |
+|---|---:|---:|---:|
+| coffee (Zen 5) | 2.29 | 7.62 | 8.03 |
+| mercury (Intel 13900KS) | 2.66 | 56.36 | 36.89 |
+| m5 (Apple M5) | 2.33 | 65.91 | 69.98 |
+| sun (EPYC 7443P, gentle run) | 4.74 | 88.35 | 153.5 |
+
+For comparison, the counter queue on the same machines is ~0.9 ns / ~0.95 ns /
+~1.6 ns on coffee, ~1.0 ns / ~2.1 ns / ~12.3 ns on mercury, ~1.8 ns / ~1.7 ns /
+~2.1 ns on m5, and ~1.8 ns / ~3.4 ns / ~18.6 ns on sun.
+
+A hardware whole-cache-line publish path using x86 `MOVDIR64B` was prototyped
+on coffee and mercury. It compiled but measured much slower (~326 ns per
+single-thread operation on coffee), so the descriptor-store path is retained.
+This reinforces that whole-cache-line atomic publication is hardware-specific
+and needs per-platform measurement rather than being assumed fast.

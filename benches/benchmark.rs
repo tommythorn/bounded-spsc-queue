@@ -1,6 +1,6 @@
 use std::thread;
 
-use bounded_spsc_queue::make;
+use bounded_spsc_queue::{make, make_cacheline};
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +17,10 @@ criterion_group!(
     bench_threaded_reverse_spsc,
     bench_single_spsc_batch,
     bench_single_spsc_bulk_scalar,
-    bench_single_spsc_skip
+    bench_single_spsc_skip,
+    bench_cacheline_spsc,
+    bench_cacheline_threaded_spsc,
+    bench_cacheline_reverse_spsc
 );
 criterion_main!(benches);
 
@@ -55,6 +58,18 @@ fn bench_single_spsc_bulk_scalar(c: &mut Criterion) {
 
 fn bench_single_spsc_skip(c: &mut Criterion) {
     c.bench_function("bench_single_spsc_skip", bench_spsc_skip);
+}
+
+fn bench_cacheline_spsc(c: &mut Criterion) {
+    c.bench_function("bench_cacheline_spsc", cacheline_spsc);
+}
+
+fn bench_cacheline_threaded_spsc(c: &mut Criterion) {
+    c.bench_function("bench_cacheline_threaded_spsc", cacheline_threaded_spsc);
+}
+
+fn bench_cacheline_reverse_spsc(c: &mut Criterion) {
+    c.bench_function("bench_cacheline_reverse_spsc", cacheline_reverse_spsc);
 }
 
 fn bench_chan(b: &mut Bencher) {
@@ -235,4 +250,60 @@ fn bench_spsc_skip(b: &mut Bencher) {
         }
         assert_eq!(black_box(c.skip_n(500)), 500);
     });
+}
+
+fn cacheline_spsc(b: &mut Bencher) {
+    let (p, c) = make_cacheline::<u64>(500);
+    b.iter(|| {
+        p.push(1u64);
+        black_box(c.pop())
+    });
+}
+
+fn cacheline_threaded_spsc(b: &mut Bencher) {
+    let (p, c) = make_cacheline::<u64>(500);
+    let flag = AtomicBool::new(false);
+    let arc_flag = Arc::new(flag);
+
+    let flag_clone = arc_flag.clone();
+    let handle = thread::spawn(move || {
+        while !flag_clone.load(Ordering::Acquire) {
+            for _ in 0..400 {
+                black_box(c.pop());
+            }
+        }
+    });
+
+    b.iter(|| p.push(1u64));
+
+    let flag_clone = arc_flag;
+    flag_clone.store(true, Ordering::Release);
+    for _ in 0..400 {
+        p.try_push(1u64);
+    }
+    handle.join().unwrap();
+}
+
+fn cacheline_reverse_spsc(b: &mut Bencher) {
+    let (p, c) = make_cacheline::<u64>(500);
+    let flag = AtomicBool::new(false);
+    let arc_flag = Arc::new(flag);
+
+    let flag_clone = arc_flag.clone();
+    let handle = thread::spawn(move || {
+        while !flag_clone.load(Ordering::Acquire) {
+            for _ in 0..400 {
+                p.push(1u64);
+            }
+        }
+    });
+
+    b.iter(|| black_box(c.pop()));
+
+    let flag_clone = arc_flag;
+    flag_clone.store(true, Ordering::Release);
+    for _ in 0..400 {
+        c.try_pop();
+    }
+    handle.join().unwrap();
 }

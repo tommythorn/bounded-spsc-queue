@@ -5,6 +5,9 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+pub mod cacheline;
+pub use cacheline::{make_cacheline, CachelineConsumer, CachelineProducer};
+
 #[cfg(feature = "cacheline64")]
 const CACHELINE_LEN: usize = 64;
 #[cfg(feature = "cacheline128")]
