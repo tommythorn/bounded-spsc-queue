@@ -43,8 +43,13 @@ fn generation_phase(abs: usize, allocated_size: usize) -> u64 {
 }
 
 #[inline]
-fn encode_desc(phase: u64, space: usize) -> u64 {
-    ((space as u64) << 1) | phase
+fn encode_desc(phase: u64, credit: usize) -> u64 {
+    phase | ((credit as u64) << 1)
+}
+
+#[inline]
+fn decode_desc(desc: u64) -> (u64, usize) {
+    (desc & 1, (desc >> 1) as usize)
 }
 
 struct CachelineBuffer<T> {
@@ -61,10 +66,11 @@ struct CachelineBuffer<T> {
 unsafe impl<T: Sync> Sync for CachelineBuffer<T> {}
 
 impl<T> CachelineBuffer<T> {
-    /// Consume completion credits from the credit queue. Each consumed credit
-    /// releases one submission slot.
-    fn drain_credits(&self, sq_head: &Cell<usize>, cq_head: &Cell<usize>) {
-        let mut sq = sq_head.get();
+    /// Consume completion entries. Each CQE carries a saturating credit count:
+    /// "there are at least C free submission slots". Credits are added to the
+    /// producer's local credit budget and capped at capacity.
+    fn drain_credits(&self, credit: &Cell<usize>, cq_head: &Cell<usize>) {
+        let mut budget = credit.get();
         let mut cq = cq_head.get();
         loop {
             let expected = generation_phase(cq, self.allocated_size);
@@ -75,10 +81,11 @@ impl<T> CachelineBuffer<T> {
             if (desc & 1) != expected {
                 break;
             }
-            sq = sq.wrapping_add(1);
+            let (_, c) = decode_desc(desc);
+            budget = budget.saturating_add(c).min(self.capacity);
             cq = cq.wrapping_add(1);
         }
-        sq_head.set(sq);
+        credit.set(budget);
         cq_head.set(cq);
     }
 
@@ -128,7 +135,7 @@ impl<T> Drop for CachelineBuffer<T> {
 /// Producer half of a cache-line-aligned small-message queue.
 pub struct CachelineProducer<T> {
     buffer: Arc<CachelineBuffer<T>>,
-    sq_head: Cell<usize>,
+    credit: Cell<usize>,
     cq_head: Cell<usize>,
 }
 
@@ -136,7 +143,13 @@ pub struct CachelineProducer<T> {
 pub struct CachelineConsumer<T> {
     buffer: Arc<CachelineBuffer<T>>,
     cq_tail: Cell<usize>,
+    pending_credits: Cell<usize>,
 }
+
+/// Completion entries are coalesced. A CQE is published only after this many
+/// submissions have been consumed since the last CQE, or when the whole queue
+/// capacity has been consumed for small queues.
+const CREDIT_BATCH: usize = 64;
 
 unsafe impl<T: Send> Send for CachelineProducer<T> {}
 unsafe impl<T: Send> Send for CachelineConsumer<T> {}
@@ -144,27 +157,28 @@ unsafe impl<T: Send> Send for CachelineConsumer<T> {}
 impl<T> CachelineProducer<T> {
     #[inline]
     pub fn try_push(&self, v: T) -> Option<T> {
-        let sq_tail = self.buffer.sq_tail.get();
-        let mut sq_head = self.sq_head.get();
-        if sq_tail.wrapping_sub(sq_head) >= self.buffer.capacity {
-            self.buffer.drain_credits(&self.sq_head, &self.cq_head);
-            sq_head = self.sq_head.get();
-            if sq_tail.wrapping_sub(sq_head) >= self.buffer.capacity {
+        let mut budget = self.credit.get();
+        if budget == 0 {
+            self.buffer.drain_credits(&self.credit, &self.cq_head);
+            budget = self.credit.get();
+            if budget == 0 {
                 return Some(v);
             }
         }
 
+        let sq_tail = self.buffer.sq_tail.get();
         let slot = unsafe { self.buffer.sq_slot(sq_tail) };
         let phase = generation_phase(sq_tail, self.buffer.allocated_size);
-        // Completion space is advisory metadata. The producer consumes credits
-        // only when the submission queue fills, so advertise the full credit
-        // queue rather than forcing a scan on every push.
+        // SQEs carry an advisory completion-space summary. Completion credits
+        // are consumed only when the producer credit budget reaches zero, so
+        // this field is not required for correctness.
         let desc = encode_desc(phase, self.buffer.capacity);
         unsafe {
             ptr::write(slot.payload.as_ptr() as *mut T, v);
             slot.desc.store(desc, Ordering::Release);
         }
         self.buffer.sq_tail.set(sq_tail.wrapping_add(1));
+        self.credit.set(budget - 1);
         None
     }
 
@@ -183,13 +197,13 @@ impl<T> CachelineProducer<T> {
         self.buffer.capacity
     }
 
+    /// Returns the producer's current view of queue occupancy.
     pub fn size(&self) -> usize {
-        let tail = self.buffer.sq_tail.get();
-        tail.wrapping_sub(self.sq_head.get())
+        self.capacity() - self.credit.get()
     }
 
     pub fn free_space(&self) -> usize {
-        self.capacity() - self.size()
+        self.credit.get()
     }
 }
 
@@ -203,23 +217,24 @@ impl<T> CachelineConsumer<T> {
         if (desc & 1) != expected {
             return None;
         }
-        // A zero space hint means the producer has no completion room; wait for
-        // the producer to consume credits before claiming this submission.
-        if (desc >> 1) == 0 {
-            return None;
-        }
 
         let v = unsafe { ptr::read(slot.payload.as_ptr()) };
-
-        let cq_tail = self.cq_tail.get();
-        let cq_slot = unsafe { self.buffer.cq_slot(cq_tail) };
-        let phase = generation_phase(cq_tail, self.buffer.allocated_size);
-        // Consumer advertises the submission queue space it can see. The value
-        // is advisory metadata; the producer still tracks credits itself.
-        let credit = encode_desc(phase, self.buffer.capacity);
-        cq_slot.desc.store(credit, Ordering::Release);
-        self.cq_tail.set(cq_tail.wrapping_add(1));
         self.buffer.sq_head.set(sq_head.wrapping_add(1));
+
+        let pending = self.pending_credits.get() + 1;
+        let batch = self.buffer.capacity.min(CREDIT_BATCH);
+        if pending >= batch {
+            let cq_tail = self.cq_tail.get();
+            let cq_slot = unsafe { self.buffer.cq_slot(cq_tail) };
+            let phase = generation_phase(cq_tail, self.buffer.allocated_size);
+            // CQE summary: at least `pending` slots have been released in the SQ.
+            let cqe_desc = encode_desc(phase, pending);
+            cq_slot.desc.store(cqe_desc, Ordering::Release);
+            self.cq_tail.set(cq_tail.wrapping_add(1));
+            self.pending_credits.set(0);
+        } else {
+            self.pending_credits.set(pending);
+        }
         Some(v)
     }
 
@@ -241,9 +256,10 @@ impl<T> CachelineConsumer<T> {
 /// Creates a cache-line-aligned small-message queue.
 ///
 /// Each slot occupies an entire cache line. The payload must fit in the slot
-/// after the descriptor word (`cacheline - 8` bytes on 64-bit targets). The
-/// producer publishes submissions, the consumer publishes completion credits,
-/// and the producer consumes those credits to release submission slots.
+/// after the descriptor word (`cacheline - 8` bytes on 64-bit targets). SQEs
+/// carry a phase bit and a completion-space summary; CQEs carry a phase bit and
+/// a submission-space credit summary. Completion credits are coalesced and are
+/// not paired one-to-one with SQEs.
 pub fn make_cacheline<T>(capacity: usize) -> (CachelineProducer<T>, CachelineConsumer<T>) {
     assert!(capacity > 0, "capacity must be greater than zero");
     assert!(
@@ -313,12 +329,13 @@ pub fn make_cacheline<T>(capacity: usize) -> (CachelineProducer<T>, CachelineCon
     (
         CachelineProducer {
             buffer: buffer.clone(),
-            sq_head: Cell::new(0),
+            credit: Cell::new(capacity),
             cq_head: Cell::new(0),
         },
         CachelineConsumer {
             buffer,
             cq_tail: Cell::new(0),
+            pending_credits: Cell::new(0),
         },
     )
 }
@@ -326,6 +343,7 @@ pub fn make_cacheline<T>(capacity: usize) -> (CachelineProducer<T>, CachelineCon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
 
     #[test]
@@ -337,6 +355,32 @@ mod tests {
         for i in 0..10 {
             assert_eq!(c.pop(), i);
         }
+        // The consumer coalesces its 10 consumed submissions into one CQE.
+        assert_eq!(c.cq_tail.get(), 1);
+    }
+
+    #[test]
+    fn test_empty_and_full() {
+        let (p, c) = make_cacheline::<u64>(4);
+        assert!(c.try_pop().is_none());
+
+        for i in 0..4 {
+            assert!(p.try_push(i).is_none());
+        }
+        let rejected = p.try_push(99).unwrap();
+        assert_eq!(rejected, 99);
+
+        // Consume half the queue; pending credits are not published yet because
+        // the batch threshold is the full capacity.
+        assert_eq!(c.pop(), 0);
+        assert_eq!(c.pop(), 1);
+        assert!(p.try_push(99).is_some());
+
+        // Consuming the rest publishes a CQE and releases the SQ slots.
+        assert_eq!(c.pop(), 2);
+        assert_eq!(c.pop(), 3);
+        assert!(p.try_push(99).is_none());
+        assert_eq!(c.pop(), 99);
     }
 
     #[test]
@@ -351,7 +395,106 @@ mod tests {
     }
 
     #[test]
-    fn test_threaded() {
+    fn test_phase_generations_non_power_of_two_capacity() {
+        let (p, c) = make_cacheline::<u32>(3);
+        for round in 0..50u32 {
+            for i in 0..3 {
+                p.push(round * 3 + i);
+            }
+            for i in 0..3 {
+                assert_eq!(c.pop(), round * 3 + i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_small_capacity_one() {
+        let (p, c) = make_cacheline::<u64>(1);
+        for round in 0..20u64 {
+            assert!(p.try_push(round).is_none());
+            assert_eq!(c.pop(), round);
+        }
+    }
+
+    #[test]
+    fn test_credit_coalescing() {
+        let (p, c) = make_cacheline::<u32>(128);
+        for i in 0..64 {
+            p.push(i);
+        }
+        for i in 0..63 {
+            assert_eq!(c.pop(), i);
+        }
+        assert_eq!(c.cq_tail.get(), 0);
+        assert_eq!(c.pending_credits.get(), 63);
+
+        assert_eq!(c.pop(), 63);
+        assert_eq!(c.cq_tail.get(), 1);
+        assert_eq!(c.pending_credits.get(), 0);
+    }
+
+    #[test]
+    fn test_credit_reuse_without_pairing() {
+        let (p, c) = make_cacheline::<u64>(256);
+        for cycle in 0..8u64 {
+            for i in 0..256 {
+                p.push(cycle * 256 + i);
+            }
+            for i in 0..256 {
+                assert_eq!(c.pop(), cycle * 256 + i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_copy_payload() {
+        let (p, c) = make_cacheline::<String>(4);
+        let values = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        for v in values.clone() {
+            p.push(v);
+        }
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.push(c.pop());
+        }
+        assert_eq!(out, values);
+        // Drop unconsumed payloads when the queue is dropped.
+        drop(out);
+        drop(p);
+        drop(c);
+    }
+
+    struct TrackedDrop {
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TrackedDrop {
+        fn drop(&mut self) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_unconsumed_payloads_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (p, c) = make_cacheline::<TrackedDrop>(5);
+        for _ in 0..5 {
+            p.push(TrackedDrop {
+                counter: counter.clone(),
+            });
+        }
+        let a = c.pop();
+        let b = c.pop();
+        drop(a);
+        drop(b);
+
+        drop(p);
+        drop(c);
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn test_threaded_stress() {
         let (p, c) = make_cacheline::<u64>(500);
         thread::spawn(move || {
             for i in 0..100000 {
@@ -359,6 +502,32 @@ mod tests {
             }
         });
         for i in 0..100000 {
+            assert_eq!(c.pop(), i);
+        }
+    }
+
+    #[test]
+    fn test_threaded_small_capacity() {
+        let (p, c) = make_cacheline::<u64>(8);
+        thread::spawn(move || {
+            for i in 0..10000 {
+                p.push(i);
+            }
+        });
+        for i in 0..10000 {
+            assert_eq!(c.pop(), i);
+        }
+    }
+
+    #[test]
+    fn test_try_push_pop_threaded() {
+        let (p, c) = make_cacheline::<u32>(64);
+        thread::spawn(move || {
+            for i in 0..20000u32 {
+                p.push(i);
+            }
+        });
+        for i in 0..20000u32 {
             assert_eq!(c.pop(), i);
         }
     }

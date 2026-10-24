@@ -137,9 +137,22 @@ Takeaways:
 
 `make_cacheline<T>(capacity)` creates an additional queue type intended for
 small IPC messages. Each slot occupies one cache line and carries payload bytes
-plus an atomic descriptor containing a phase bit and advisory free-space
-metadata. The producer publishes submission slots; the consumer publishes
-completion credits; the producer consumes credits to reclaim submission slots.
+plus an atomic descriptor containing a phase bit and a saturating summary field.
+
+The protocol is deliberately loosely coupled:
+
+- SQEs carry a phase bit and a saturating C field meaning "at least C slots are
+  free in the completion queue".
+- CQEs are not paired one-to-one with SQEs. The consumer publishes them when
+  it wants or after enough SQEs have been released.
+- Each CQE carries a phase bit and a saturating C field meaning "at least C
+  slots are free in the submission queue".
+- The producer keeps a local credit budget derived from CQE summaries and
+  decrements it for each SQE it publishes.
+
+This minimizes cache-line bouncing: the producer owns and publishes SQ lines,
+the consumer reads them without writing them back to the producer's line, and
+completion progress travels through a separate CQ cache-line channel.
 
 ```rust
 use bounded_spsc_queue::make_cacheline;
@@ -160,14 +173,15 @@ It is deliberately not the default: it trades extra cache-line traffic for a
 phase-bit/credit protocol, and current measurements show it is slower than the
 counter queue on all tested machines.
 
-Cache-line queue measurements (ns per operation; Criterion 0.8.2):
+Cache-line queue measurements after coalescing completion credits (ns per
+operation; Criterion 0.8.2):
 
 | Platform | Single | Threaded forward | Threaded reverse |
 |---|---:|---:|---:|
-| coffee (Zen 5) | 2.29 | 7.62 | 8.03 |
-| mercury (Intel 13900KS) | 2.66 | 56.36 | 36.89 |
-| m5 (Apple M5) | 2.33 | 65.91 | 69.98 |
-| sun (EPYC 7443P, gentle run) | 4.74 | 88.35 | 153.5 |
+| coffee (Zen 5) | 1.65 | 7.56 | 7.97 |
+| mercury (Intel 13900KS) | 1.64 | 50.95 | 54.38 |
+| m5 (Apple M5) | 1.89 | 13.78 | 20.83 |
+| sun (EPYC 7443P, gentle run, noisy) | 3.08 | 208.7 | 228.3 |
 
 For comparison, the counter queue on the same machines is ~0.9 ns / ~0.95 ns /
 ~1.6 ns on coffee, ~1.0 ns / ~2.1 ns / ~12.3 ns on mercury, ~1.8 ns / ~1.7 ns /
@@ -178,3 +192,8 @@ on coffee and mercury. It compiled but measured much slower (~326 ns per
 single-thread operation on coffee), so the descriptor-store path is retained.
 This reinforces that whole-cache-line atomic publication is hardware-specific
 and needs per-platform measurement rather than being assumed fast.
+
+The cache-line queue test suite covers empty/full behavior, phase generations,
+non-power-of-two capacities, coalesced credits, credit reuse without pairing,
+non-`Copy` payload ownership, unconsumed payload drops, small capacities, and
+threaded stress tests at 10k–100k messages.

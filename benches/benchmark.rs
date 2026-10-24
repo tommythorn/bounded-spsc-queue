@@ -302,7 +302,7 @@ fn cacheline_reverse_spsc(b: &mut Bencher) {
 
     let flag_clone = arc_flag;
     flag_clone.store(true, Ordering::Release);
-    for _ in 0..400 {
+    for _ in 0..1000 {
         c.try_pop();
     }
     handle.join().unwrap();
